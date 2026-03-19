@@ -1,0 +1,19 @@
+# 编译产物
+*.exe
+*.o
+*.res
+*.out
+/out/
+/build/
+
+# IDE 配置文件
+.vs/
+.vscode/
+*.sln
+*.user
+
+# 运行依赖（本地自用，无需上传）
+adb.exe
+scrcpy.exe
+*.dll
+scrcpy-server
