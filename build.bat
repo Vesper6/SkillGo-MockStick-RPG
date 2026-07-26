@@ -1,24 +1,29 @@
 @echo off
+chcp 65001 >nul
 setlocal enabledelayedexpansion
 color 0b
 
 cd /d %~dp0
 
-echo [1/3] ÇåÀí»·¾³...
+where g++ >nul 2>&1 || (echo [é”™è¯¯] æœªæ‰¾åˆ° g++, è¯·å…ˆå®‰è£… w64devkit æˆ– MinGW-w64 å¹¶åŠ å…¥ PATH & pause & exit /b 1)
+where windres >nul 2>&1 || (echo [é”™è¯¯] æœªæ‰¾åˆ° windres, è¯·ç¡®è®¤ MinGW å®‰è£…å®Œæ•´ & pause & exit /b 1)
+
+echo [1/3] æ¸…ç†æ—§äº§ç‰©...
 if exist MockStick-RPG.exe del /q MockStick-RPG.exe
 if exist resource.res del /q resource.res
 
-echo [2/3] ±àÒë×ÊÔ´...
+echo [2/3] ç¼–è¯‘èµ„æº...
 windres resource.rc -O coff -o resource.res
+if %errorlevel% neq 0 (echo [é”™è¯¯] èµ„æºç¼–è¯‘å¤±è´¥ & pause & exit /b 1)
 
-echo [3/3] ¿ªÊ¼¹¹½¨ Pro v5.2...
+echo [3/3] å¼€å§‹ç¼–è¯‘ Pro v5.3...
 set IMG_DIR=./externals/imgui
 set SOURCES="MockStick-RPG.cpp" %IMG_DIR%/imgui*.cpp %IMG_DIR%/backends/imgui_impl_win32.cpp %IMG_DIR%/backends/imgui_impl_dx11.cpp
 set INCS=-I"%IMG_DIR%" -I"%IMG_DIR%/backends"
 
-:: ºËĞÄĞŞÕı£ºÌí¼ÓÁË -ldwmapi ºÍ -ld3dcompiler
 g++ %SOURCES% resource.res -o MockStick-RPG.exe ^
     %INCS% ^
+    -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 ^
     -ld3d11 -ldxgi -ldwmapi -ld3dcompiler -luser32 -lshcore -lgdi32 -ladvapi32 ^
     -static-libgcc -static-libstdc++ ^
     -pthread ^
@@ -26,9 +31,9 @@ g++ %SOURCES% resource.res -o MockStick-RPG.exe ^
 
 if %errorlevel% equ 0 (
     echo ================================
-    echo ¹¹½¨³É¹¦: MockStick-RPG.exe
+    echo æ„å»ºæˆåŠŸ: MockStick-RPG.exe
     echo ================================
 ) else (
-    echo ¹¹½¨Ê§°Ü£¬Çë¼ì²é±¨´í¡£
+    echo æ„å»ºå¤±è´¥ï¼Œè¯·æ£€æŸ¥æŠ¥é”™ã€‚
 )
 pause
