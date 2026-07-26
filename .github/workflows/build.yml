@@ -6,6 +6,14 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "发布 Release 的标签名 (如 v6.0), 留空则仅构建"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -28,9 +36,12 @@ jobs:
           name: MockStick-RPG-win64
           path: MockStick-RPG.exe
 
-      - name: 发布 Release (仅 v* 标签)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: 发布 Release (v* 标签或手动指定标签)
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag }}
           files: MockStick-RPG.exe
           generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
