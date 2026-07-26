@@ -38,7 +38,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 
 # 5. 链接 Windows 系统必要的库 (针对 DX11 后端)
-target_link_libraries(${PROJECT_NAME} PRIVATE d3d11 d3dcompiler dwmapi)
+target_link_libraries(${PROJECT_NAME} PRIVATE d3d11 d3dcompiler dwmapi ws2_32)
 
 # 如果支持，请为 MSVC 编译器启用热重载（保留你原有的配置）
 if (POLICY CMP0141)
