@@ -13,9 +13,12 @@
 *.sln
 *.user
 
-# 运行时生成的配置
+# 运行时生成的配置与数据
 imgui.ini
 mockstick_config.ini
+logs/
+profiles/
+*.mstr
 
 # 运行依赖（本地自用，无需上传）
 adb.exe

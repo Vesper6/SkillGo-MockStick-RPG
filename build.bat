@@ -24,7 +24,7 @@ set INCS=-I"%IMG_DIR%" -I"%IMG_DIR%/backends"
 g++ %SOURCES% resource.res -o MockStick-RPG.exe ^
     %INCS% ^
     -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 ^
-    -ld3d11 -ldxgi -ldwmapi -ld3dcompiler -luser32 -lshcore -lgdi32 -ladvapi32 ^
+    -ld3d11 -ldxgi -ldwmapi -ld3dcompiler -luser32 -lshcore -lgdi32 -ladvapi32 -lws2_32 ^
     -static-libgcc -static-libstdc++ ^
     -pthread ^
     -mwindows -O3

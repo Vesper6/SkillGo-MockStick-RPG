@@ -19,7 +19,7 @@ echo "[2/2] 编译 MockStick-RPG.exe (CXX=$CXX)..."
     resource.res \
     -I"$IMG" -I"$IMG/backends" \
     -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 \
-    -ld3d11 -ldxgi -ldwmapi -ld3dcompiler -luser32 -lgdi32 -ladvapi32 \
+    -ld3d11 -ldxgi -ldwmapi -ld3dcompiler -luser32 -lgdi32 -ladvapi32 -lws2_32 \
     -static -static-libgcc -static-libstdc++ \
     -mwindows -O2 -o MockStick-RPG.exe
 
