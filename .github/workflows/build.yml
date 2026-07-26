@@ -1,0 +1,36 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: MinGW 交叉编译 Windows x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 MinGW-w64 工具链
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+
+      - name: 编译 MockStick-RPG.exe
+        run: ./ci/build-mingw.sh
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: MockStick-RPG-win64
+          path: MockStick-RPG.exe
+
+      - name: 发布 Release (仅 v* 标签)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MockStick-RPG.exe
+          generate_release_notes: true

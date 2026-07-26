@@ -2,6 +2,7 @@
 *.exe
 *.o
 *.res
+*.aps
 *.out
 /out/
 /build/
@@ -11,6 +12,10 @@
 .vscode/
 *.sln
 *.user
+
+# 运行时生成的配置
+imgui.ini
+mockstick_config.ini
 
 # 运行依赖（本地自用，无需上传）
 adb.exe

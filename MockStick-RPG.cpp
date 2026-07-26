@@ -1,4 +1,4 @@
-﻿#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <d3d11.h>
 #include <vector>
@@ -6,6 +6,8 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <cstdlib>
 #include <tlhelp32.h>
 
 #pragma comment(lib, "d3d11.lib")
@@ -19,15 +21,26 @@
 
 #define IDI_ICON1 101
 
+#ifndef PW_RENDERFULLCONTENT
+#define PW_RENDERFULLCONTENT 0x00000002
+#endif
+
 // --- 全局变量 ---
 static int g_PhoneW = 1080, g_PhoneH = 2340;
 static int g_JoyX = 540, g_JoyY = 1500, g_StepSize = 400;
+static int g_SwipeMs = 180;       // 摇杆滑动时长 (ms)
+static int g_TapThreshold = 10;   // 位移小于该值视为点按
+static int g_LoopCount = 0;       // 脚本循环次数, 0 = 无限
 static char g_CurrentSerial[64] = "等待扫描...";
 static char g_ScriptFileName[128] = "rpg_macro_01.txt";
+static char g_StatusMsg[256] = "";
+static const char* kConfigFile = "mockstick_config.ini";
 
 struct AdbAction { int x1, y1, x2, y2, ms; float delay; };
 std::vector<AdbAction> g_Script;
+std::mutex g_ScriptMutex;         // 保护 g_Script: UI 线程与回放线程共用
 std::atomic<bool> g_IsRecording{ false }, g_IsPlaying{ false };
+std::atomic<int> g_PlayedLoops{ 0 };
 ULONGLONG g_LastActionTime = 0;
 
 HWND g_ScrcpyHwnd = NULL;
@@ -38,6 +51,34 @@ static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 static FILE* g_AdbPipe = nullptr;
 
 // --- 基础功能函数 ---
+
+void SaveConfig() {
+    std::ofstream ofs(kConfigFile);
+    if (!ofs.is_open()) return;
+    ofs << g_PhoneW << " " << g_PhoneH << " " << g_JoyX << " " << g_JoyY << " "
+        << g_StepSize << " " << g_SwipeMs << " " << g_LoopCount << "\n"
+        << g_ScriptFileName << "\n";
+}
+
+void LoadConfig() {
+    std::ifstream ifs(kConfigFile);
+    if (!ifs.is_open()) return;
+    int pw, ph, jx, jy, step, ms, loop;
+    if (ifs >> pw >> ph >> jx >> jy >> step >> ms >> loop) {
+        if (pw > 0 && ph > 0) { g_PhoneW = pw; g_PhoneH = ph; }
+        g_JoyX = jx; g_JoyY = jy;
+        if (step > 0) g_StepSize = step;
+        if (ms > 0) g_SwipeMs = ms;
+        if (loop >= 0) g_LoopCount = loop;
+        ifs.ignore();
+        char name[128];
+        if (ifs.getline(name, sizeof(name)) && name[0]) snprintf(g_ScriptFileName, sizeof(g_ScriptFileName), "%s", name);
+    }
+}
+
+bool SerialValid() {
+    return g_CurrentSerial[0] && strcmp(g_CurrentSerial, "等待扫描...") != 0 && strcmp(g_CurrentSerial, "未发现设备") != 0 && strcmp(g_CurrentSerial, "错误") != 0;
+}
 
 std::string ScanAdbDevices() {
     FILE* pipe = _popen("adb devices", "r");
@@ -75,9 +116,15 @@ HWND FindScrcpyWindow() {
 void RunAdb(const char* cmd) { if (g_AdbPipe) { fprintf(g_AdbPipe, "%s\n", cmd); fflush(g_AdbPipe); } }
 
 void Swipe(int x1, int y1, int x2, int y2, int ms) {
-    char c[128]; sprintf(c, "input swipe %d %d %d %d %d", x1, y1, x2, y2, ms);
+    char c[160];
+    // 位移极小时发送 tap, 避免原地 swipe 被游戏识别为长按
+    if (abs(x2 - x1) < g_TapThreshold && abs(y2 - y1) < g_TapThreshold)
+        snprintf(c, sizeof(c), "input tap %d %d", x1, y1);
+    else
+        snprintf(c, sizeof(c), "input swipe %d %d %d %d %d", x1, y1, x2, y2, ms);
     RunAdb(c);
     if (g_IsRecording) {
+        std::lock_guard<std::mutex> lk(g_ScriptMutex);
         float d = g_Script.empty() ? 0 : (float)(GetTickCount64() - g_LastActionTime) / 1000.0f;
         g_Script.push_back({ x1, y1, x2, y2, ms, d });
         g_LastActionTime = GetTickCount64();
@@ -94,7 +141,10 @@ public:
         if (w < 100) return;
         HDC hSrc = GetDC(hw), hMem = CreateCompatibleDC(hSrc);
         HBITMAP hBm = CreateCompatibleBitmap(hSrc, w, h);
-        SelectObject(hMem, hBm); PrintWindow(hw, hMem, PW_RENDERFULLCONTENT);
+        HGDIOBJ hOld = SelectObject(hMem, hBm);
+        PrintWindow(hw, hMem, PW_RENDERFULLCONTENT);
+        // 必须先移出 DC 再 DeleteObject, 否则删除失败导致 GDI 句柄每帧泄漏
+        SelectObject(hMem, hOld);
         BITMAPINFO bi = { 0 }; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
         std::vector<DWORD> px(w * h); GetDIBits(hMem, hBm, 0, h, &px[0], &bi, DIB_RGB_COLORS);
         if (!Texture || mW != w || mH != h) {
@@ -113,41 +163,65 @@ StableMirror g_Mirror;
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) return true;
+    if (msg == WM_SIZE && g_pd3dDevice && g_pSwapChain && wParam != SIZE_MINIMIZED) {
+        if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
+        g_pSwapChain->ResizeBuffers(0, LOWORD(lParam), HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
+        ID3D11Texture2D* pBB; g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBB));
+        g_pd3dDevice->CreateRenderTargetView(pBB, nullptr, &g_mainRenderTargetView); pBB->Release();
+        return 0;
+    }
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
 int main(int, char**) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    LoadConfig();
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(NULL), nullptr, nullptr, nullptr, nullptr, L"MockStickRPG", nullptr };
     wc.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_ICON1));
     RegisterClassExW(&wc);
-    HWND hwnd = CreateWindowW(wc.lpszClassName, L"MockStick-RPG Pro v5.2", WS_OVERLAPPEDWINDOW, 100, 100, 2100, 1450, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND hwnd = CreateWindowW(wc.lpszClassName, L"MockStick-RPG Pro v5.3", WS_OVERLAPPEDWINDOW, 100, 100, 2100, 1450, nullptr, nullptr, wc.hInstance, nullptr);
 
     DXGI_SWAP_CHAIN_DESC sd = {}; sd.BufferCount = 2; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow = hwnd; sd.SampleDesc.Count = 1; sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-    D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, nullptr, &g_pd3dDeviceContext);
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, nullptr, &g_pd3dDeviceContext);
+    if (FAILED(hr)) // 无独显/远程桌面等场景回退到软件渲染
+        hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, nullptr, &g_pd3dDeviceContext);
+    if (FAILED(hr)) { MessageBoxW(hwnd, L"D3D11 初始化失败", L"MockStick-RPG", MB_ICONERROR); return 1; }
     ID3D11Texture2D* pBB; g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBB)); g_pd3dDevice->CreateRenderTargetView(pBB, nullptr, &g_mainRenderTargetView); pBB->Release();
 
     ShowWindow(hwnd, SW_SHOWDEFAULT);
     ImGui::CreateContext();
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
-    ImGui::GetIO().Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", 22.0f, nullptr, ImGui::GetIO().Fonts->GetGlyphRangesChineseFull());
+    // 按优先级探测系统中文字体, 全部缺失时退回 ImGui 默认字体保证可用
+    const char* fontCandidates[] = { "C:\\Windows\\Fonts\\msyh.ttc", "C:\\Windows\\Fonts\\msyhbd.ttc", "C:\\Windows\\Fonts\\simhei.ttf", "C:\\Windows\\Fonts\\simsun.ttc" };
+    for (const char* f : fontCandidates) {
+        if (GetFileAttributesA(f) != INVALID_FILE_ATTRIBUTES) {
+            ImGui::GetIO().Fonts->AddFontFromFileTTF(f, 22.0f, nullptr, ImGui::GetIO().Fonts->GetGlyphRangesChineseFull());
+            break;
+        }
+    }
 
-    strcpy(g_CurrentSerial, ScanAdbDevices().c_str());
+    snprintf(g_CurrentSerial, sizeof(g_CurrentSerial), "%s", ScanAdbDevices().c_str());
 
     while (true) {
         MSG msg; while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); if (msg.message == WM_QUIT) goto end; }
 
-        // --- 核心新增：WASD 键盘监听 ---
+        // --- WASD 键盘监听 (支持对角线组合键) ---
         // 仅当窗口获得焦点且非输入状态时响应，防止打字冲突
         if (GetForegroundWindow() == hwnd && !ImGui::GetIO().WantTextInput) {
             static ULONGLONG lastKeyTime = 0;
             if (GetTickCount64() - lastKeyTime > 200) { // 防止连发过快
-                if (GetAsyncKeyState('W') & 0x8000) { Swipe(g_JoyX, g_JoyY, g_JoyX, g_JoyY - g_StepSize, 180); lastKeyTime = GetTickCount64(); }
-                if (GetAsyncKeyState('S') & 0x8000) { Swipe(g_JoyX, g_JoyY, g_JoyX, g_JoyY + g_StepSize, 180); lastKeyTime = GetTickCount64(); }
-                if (GetAsyncKeyState('A') & 0x8000) { Swipe(g_JoyX, g_JoyY, g_JoyX - g_StepSize, g_JoyY, 180); lastKeyTime = GetTickCount64(); }
-                if (GetAsyncKeyState('D') & 0x8000) { Swipe(g_JoyX, g_JoyY, g_JoyX + g_StepSize, g_JoyY, 180); lastKeyTime = GetTickCount64(); }
+                int dx = 0, dy = 0;
+                if (GetAsyncKeyState('W') & 0x8000) dy -= 1;
+                if (GetAsyncKeyState('S') & 0x8000) dy += 1;
+                if (GetAsyncKeyState('A') & 0x8000) dx -= 1;
+                if (GetAsyncKeyState('D') & 0x8000) dx += 1;
+                if (dx || dy) {
+                    float k = (dx && dy) ? 0.7071f : 1.0f; // 对角线归一化, 保持滑动距离一致
+                    Swipe(g_JoyX, g_JoyY, g_JoyX + (int)(dx * g_StepSize * k), g_JoyY + (int)(dy * g_StepSize * k), g_SwipeMs);
+                    lastKeyTime = GetTickCount64();
+                }
             }
         }
 
@@ -187,36 +261,51 @@ int main(int, char**) {
         if (ImGui::CollapsingHeader("1. 设备管理", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::InputText("序列号", g_CurrentSerial, 64);
             float bw = ImGui::GetContentRegionAvail().x / 2.0f - 10;
-            if (ImGui::Button("刷新设备列表", ImVec2(bw, 50))) strcpy(g_CurrentSerial, ScanAdbDevices().c_str());
+            if (ImGui::Button("刷新设备列表", ImVec2(bw, 50))) snprintf(g_CurrentSerial, sizeof(g_CurrentSerial), "%s", ScanAdbDevices().c_str());
             ImGui::SameLine();
             if (ImGui::Button("连接镜像窗口", ImVec2(bw, 50))) {
-                system("taskkill /F /IM scrcpy.exe /T > nul 2>&1");
-                Sleep(800);
-                char cmd[256]; sprintf(cmd, "cmd /c scrcpy -s %s --no-audio --window-title \"MockStick_View\"", g_CurrentSerial);
-                WinExec(cmd, SW_HIDE);
-                if (g_AdbPipe) _pclose(g_AdbPipe);
-                char adb[128]; sprintf(adb, "adb -s %s shell", g_CurrentSerial);
-                g_AdbPipe = _popen(adb, "w");
+                if (!SerialValid()) {
+                    snprintf(g_StatusMsg, sizeof(g_StatusMsg), "序列号无效, 请先刷新设备列表");
+                }
+                else {
+                    system("taskkill /F /IM scrcpy.exe /T > nul 2>&1");
+                    Sleep(800);
+                    char cmd[256]; snprintf(cmd, sizeof(cmd), "cmd /c scrcpy -s %s --no-audio --window-title \"MockStick_View\"", g_CurrentSerial);
+                    WinExec(cmd, SW_HIDE);
+                    if (g_AdbPipe) _pclose(g_AdbPipe);
+                    char adb[128]; snprintf(adb, sizeof(adb), "adb -s %s shell", g_CurrentSerial);
+                    g_AdbPipe = _popen(adb, "w");
+                    snprintf(g_StatusMsg, sizeof(g_StatusMsg), "已连接: %s", g_CurrentSerial);
+                }
             }
+            if (g_StatusMsg[0]) ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%s", g_StatusMsg);
         }
 
         // 2. 宏指令脚本控制
         if (ImGui::CollapsingHeader("2. 宏指令脚本控制", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::InputText("脚本文件名", g_ScriptFileName, 128);
-            ImGui::Text("内存指令步数: %d", (int)g_Script.size());
+            {
+                std::lock_guard<std::mutex> lk(g_ScriptMutex);
+                ImGui::Text("内存指令步数: %d", (int)g_Script.size());
+            }
             float bw = ImGui::GetContentRegionAvail().x / 3.0f - 10;
-            ImGui::BeginDisabled(g_IsRecording);
+            ImGui::BeginDisabled(g_IsRecording || g_IsPlaying);
             if (ImGui::Button("载入脚本", ImVec2(bw, 40))) {
                 std::ifstream ifs(g_ScriptFileName);
-                if (ifs.is_open()) { g_Script.clear(); AdbAction a; while (ifs >> a.x1 >> a.y1 >> a.x2 >> a.y2 >> a.ms >> a.delay) g_Script.push_back(a); }
+                if (ifs.is_open()) {
+                    std::lock_guard<std::mutex> lk(g_ScriptMutex);
+                    g_Script.clear(); AdbAction a;
+                    while (ifs >> a.x1 >> a.y1 >> a.x2 >> a.y2 >> a.ms >> a.delay) g_Script.push_back(a);
+                }
             }
             ImGui::SameLine();
             if (ImGui::Button("保存脚本", ImVec2(bw, 40))) {
                 std::ofstream ofs(g_ScriptFileName);
+                std::lock_guard<std::mutex> lk(g_ScriptMutex);
                 for (auto& a : g_Script) ofs << a.x1 << " " << a.y1 << " " << a.x2 << " " << a.y2 << " " << a.ms << " " << a.delay << "\n";
             }
             ImGui::SameLine();
-            if (ImGui::Button("清空指令", ImVec2(bw, 40))) g_Script.clear();
+            if (ImGui::Button("清空指令", ImVec2(bw, 40))) { std::lock_guard<std::mutex> lk(g_ScriptMutex); g_Script.clear(); }
             ImGui::EndDisabled();
 
             if (g_IsRecording) {
@@ -225,33 +314,78 @@ int main(int, char**) {
                 ImGui::PopStyleColor();
             }
             else {
-                if (ImGui::Button("开始录制", ImVec2(-1, 50))) { g_Script.clear(); g_IsRecording = true; g_LastActionTime = GetTickCount64(); }
+                ImGui::BeginDisabled(g_IsPlaying);
+                if (ImGui::Button("开始录制", ImVec2(-1, 50))) {
+                    { std::lock_guard<std::mutex> lk(g_ScriptMutex); g_Script.clear(); }
+                    g_IsRecording = true; g_LastActionTime = GetTickCount64();
+                }
+                ImGui::EndDisabled();
             }
 
-            if (!g_IsRecording && !g_Script.empty()) {
+            bool hasScript;
+            { std::lock_guard<std::mutex> lk(g_ScriptMutex); hasScript = !g_Script.empty(); }
+            if (!g_IsRecording && hasScript) {
+                ImGui::SetNextItemWidth(200);
+                ImGui::InputInt("循环次数 (0=无限)", &g_LoopCount);
+                if (g_LoopCount < 0) g_LoopCount = 0;
+                if (g_IsPlaying) { ImGui::SameLine(); ImGui::Text("已完成循环: %d", g_PlayedLoops.load()); }
                 if (ImGui::Button(g_IsPlaying ? "停止脚本" : "启动循环脚本", ImVec2(-1, 50))) {
                     if (g_IsPlaying) g_IsPlaying = false;
-                    else std::thread([]() { g_IsPlaying = true; while (g_IsPlaying) { for (auto& a : g_Script) { if (!g_IsPlaying)break; Sleep((DWORD)(a.delay * 1000)); Swipe(a.x1, a.y1, a.x2, a.y2, a.ms); } } }).detach();
+                    else {
+                        g_IsPlaying = true; g_PlayedLoops = 0;
+                        int loops = g_LoopCount;
+                        std::thread([loops]() {
+                            // 回放使用脚本快照, 避免与 UI 线程竞争 g_Script
+                            std::vector<AdbAction> script;
+                            { std::lock_guard<std::mutex> lk(g_ScriptMutex); script = g_Script; }
+                            int done = 0;
+                            while (g_IsPlaying && (loops == 0 || done < loops)) {
+                                for (auto& a : script) {
+                                    if (!g_IsPlaying) break;
+                                    // 分片等待, 让"停止脚本"即时生效
+                                    DWORD wait = (DWORD)(a.delay * 1000);
+                                    while (wait > 0 && g_IsPlaying) { DWORD s = wait > 50 ? 50 : wait; Sleep(s); wait -= s; }
+                                    if (!g_IsPlaying) break;
+                                    Swipe(a.x1, a.y1, a.x2, a.y2, a.ms);
+                                }
+                                done++; g_PlayedLoops = done;
+                            }
+                            g_IsPlaying = false;
+                            }).detach();
+                    }
                 }
             }
         }
 
         // 3. RPG虚拟摇杆
         if (ImGui::CollapsingHeader("3. RPG虚拟摇杆映射", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::BulletText("物理键盘 WASD 已同步激活。");
+            ImGui::BulletText("物理键盘 WASD 已同步激活, 支持对角线组合键。");
             float cw = 160, ch = 80;
             ImGui::SetCursorPosX(480);
-            if (ImGui::Button("向上 (W)", ImVec2(cw, ch))) Swipe(g_JoyX, g_JoyY, g_JoyX, g_JoyY - g_StepSize, 180);
+            if (ImGui::Button("向上 (W)", ImVec2(cw, ch))) Swipe(g_JoyX, g_JoyY, g_JoyX, g_JoyY - g_StepSize, g_SwipeMs);
             ImGui::SetCursorPosX(300);
-            if (ImGui::Button("向左 (A)", ImVec2(cw, ch))) Swipe(g_JoyX, g_JoyY, g_JoyX - g_StepSize, g_JoyY, 180);
+            if (ImGui::Button("向左 (A)", ImVec2(cw, ch))) Swipe(g_JoyX, g_JoyY, g_JoyX - g_StepSize, g_JoyY, g_SwipeMs);
             ImGui::SameLine(); ImGui::Dummy(ImVec2(180, 0)); ImGui::SameLine();
-            if (ImGui::Button("向右 (D)", ImVec2(cw, ch))) Swipe(g_JoyX, g_JoyY, g_JoyX + g_StepSize, g_JoyY, 180);
+            if (ImGui::Button("向右 (D)", ImVec2(cw, ch))) Swipe(g_JoyX, g_JoyY, g_JoyX + g_StepSize, g_JoyY, g_SwipeMs);
             ImGui::SetCursorPosX(480);
-            if (ImGui::Button("向下 (S)", ImVec2(cw, ch))) Swipe(g_JoyX, g_JoyY, g_JoyX, g_JoyY + g_StepSize, 180);
+            if (ImGui::Button("向下 (S)", ImVec2(cw, ch))) Swipe(g_JoyX, g_JoyY, g_JoyX, g_JoyY + g_StepSize, g_SwipeMs);
         }
 
-        // 4. 全局系统控制
-        if (ImGui::CollapsingHeader("4. 全局系统控制", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // 4. 摇杆与设备参数
+        if (ImGui::CollapsingHeader("4. 摇杆与设备参数", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::SetNextItemWidth(200); ImGui::InputInt("手机分辨率 宽", &g_PhoneW); ImGui::SameLine();
+            ImGui::SetNextItemWidth(200); ImGui::InputInt("高", &g_PhoneH);
+            ImGui::SetNextItemWidth(200); ImGui::InputInt("摇杆中心 X", &g_JoyX); ImGui::SameLine();
+            ImGui::SetNextItemWidth(200); ImGui::InputInt("Y", &g_JoyY);
+            ImGui::SliderInt("滑动步长 (px)", &g_StepSize, 50, 1000);
+            ImGui::SliderInt("滑动时长 (ms)", &g_SwipeMs, 50, 1000);
+            if (g_PhoneW < 1) g_PhoneW = 1;
+            if (g_PhoneH < 1) g_PhoneH = 1;
+            if (ImGui::Button("保存参数配置", ImVec2(-1, 40))) { SaveConfig(); snprintf(g_StatusMsg, sizeof(g_StatusMsg), "参数已保存到 %s", kConfigFile); }
+        }
+
+        // 5. 全局系统控制
+        if (ImGui::CollapsingHeader("5. 全局系统控制", ImGuiTreeNodeFlags_DefaultOpen)) {
             float sw = ImGui::GetContentRegionAvail().x / 3.0f - 10;
             if (ImGui::Button("返回键", ImVec2(sw, 70))) RunAdb("input keyevent 4");
             ImGui::SameLine();
@@ -260,14 +394,15 @@ int main(int, char**) {
             if (ImGui::Button("音量减", ImVec2(sw, 70))) RunAdb("input keyevent 25");
         }
 
-        // 5. 使用说明书
-        if (ImGui::CollapsingHeader("5. 使用说明书", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::BulletText("一. 键盘 WASD 直接映射到摇杆中心。");
+        // 6. 使用说明书
+        if (ImGui::CollapsingHeader("6. 使用说明书", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::BulletText("一. 键盘 WASD 直接映射到摇杆中心, 组合按键可走对角线。");
             ImGui::BulletText("二. 若键盘无效，请确保鼠标点击了一下本软件窗口。");
-            ImGui::BulletText("三.脚本文件名支持手动修改，建议以 .txt 结尾以便识别。");
-            ImGui::BulletText("四.清空列表按钮仅清空内存中的指令，不会删除已保存的文件。");
-            ImGui::BulletText("五.录制模式下，载入、保存和清空功能将被锁定以保护数据。");
-            ImGui::BulletText("六.执行脚本时，系统会根据录制时的时间差自动模拟真实的等待。");
+            ImGui::BulletText("三. 脚本文件名支持手动修改，建议以 .txt 结尾以便识别。");
+            ImGui::BulletText("四. 清空列表按钮仅清空内存中的指令，不会删除已保存的文件。");
+            ImGui::BulletText("五. 录制或回放期间，载入、保存和清空功能将被锁定以保护数据。");
+            ImGui::BulletText("六. 执行脚本时，系统会根据录制时的时间差自动模拟真实的等待。");
+            ImGui::BulletText("七. 摇杆中心/步长等参数可在第 4 节调整并持久化保存。");
         }
 
         ImGui::End();
@@ -278,5 +413,16 @@ int main(int, char**) {
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_pSwapChain->Present(1, 0);
     }
-end: return 0;
+end:
+    // 退出清理: 停线程、存配置、断开 ADB、释放渲染资源
+    g_IsPlaying = false; g_IsRecording = false;
+    SaveConfig();
+    if (g_AdbPipe) { _pclose(g_AdbPipe); g_AdbPipe = nullptr; }
+    ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
+    if (g_Mirror.Texture) { g_Mirror.Texture->Release(); g_Mirror.pTex->Release(); }
+    if (g_mainRenderTargetView) g_mainRenderTargetView->Release();
+    if (g_pSwapChain) g_pSwapChain->Release();
+    if (g_pd3dDeviceContext) g_pd3dDeviceContext->Release();
+    if (g_pd3dDevice) g_pd3dDevice->Release();
+    return 0;
 }
